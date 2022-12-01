@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# https://virtio-fs.gitlab.io/howto-boot.html
+#
+# cd tmp/initramfs && zstdcat ../initramfs-linux.img | cpio -idmv
+# find . | cpio -o -H newc -R root:root | zstdmt > ../initramfs-linux-hfd
+
+set -euo pipefail
+
+mac=52:54:00:11:22:08
+dhcp_start=10.0.2.17
+self="$(readlink -f $0)"
+
+container-extract() {
+	local tag="$1"
+	docker run --rm -ti -v "$(pwd)/tmp:/tmp2" "$tag" \
+	    bash -c "pacman -Syu --noconfirm && pacman -S --noconfirm linux && rm -rf /var/cache/pacman/pkg/* && tar cvjf /tmp2/$tag.tar.bz2 --one-file-system /"
+	du -h "tmp/$tag.tar.bz2"
+}
+
+vm() {
+	[ "$(whoami)" = root ] || exec sudo $self vm
+	local ram=512
+	local forwards=""
+
+	qemu-system-x86_64 \
+	    -nographic -append "console=ttyS0 rootfstype=virtiofs root=myfs rw raid=noautodetect" \
+		-cpu host \
+		-m $ram -enable-kvm -smp $(nproc) \
+		-net nic,model=e1000,macaddr=$mac \
+		-net user,dhcpstart=$dhcp_start,$forwards \
+		-kernel tmp/bzImage \
+		-initrd tmp/initramfs-linux.img \
+		-chardev socket,id=char0,path=/tmp/vhostqemu \
+		-device vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=myfs \
+
+#		-drive if=none,id=vd1,format=raw,file=9front.iso \
+#		-device scsi-cd,drive=vd1,bootindex=0
+}
+
+k() {
+	sudo pkill -f qemu-system-x86_64
+}
+
+cd "$(readlink -f $(dirname $0))"
+"$@"
