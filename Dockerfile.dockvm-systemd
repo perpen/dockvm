@@ -1,0 +1,10 @@
+FROM dockvm-base
+RUN ls \
+        /etc/systemd/system/*.wants/* \
+        /lib/systemd/system/local-fs.target.wants/* \
+        /lib/systemd/system/multi-user.target.wants/* \
+        /lib/systemd/system/sockets.target.wants/*udev* \
+        /lib/systemd/system/sysinit.target.wants/* \
+    | grep -Ev '/(getty@tty1.service|getty.target|systemd-tmpfiles-setup.service)' \
+    | xargs rm
+CMD ["/usr/lib/systemd/systemd"]

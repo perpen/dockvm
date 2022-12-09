@@ -1,0 +1,6 @@
+FROM archlinux
+RUN pacman -Syu --noconfirm \
+    && pacman -S --noconfirm \
+        sudo vim base-devel xmlto kmod inetutils bc libelf git cpio perl tar xz make flex bison
+RUN echo -e 'root\nroot' | passwd \
+    && ln -sf /usr/share/zoneinfo/Europe/London /etc/localtime

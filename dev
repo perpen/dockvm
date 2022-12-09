@@ -1,54 +1,81 @@
 #!/bin/bash
-set -euo pipefail
+set -xeuo pipefail
 
 TMP=/tmp/dockvm # ram for speed
-VAR_TMP=/var/tmp/dockvm # for storing raw disk image, not supported on tmpfs
-TAG="archlinux-fs"
-self="$(readlink -f $0)"
+VAR_TMP=/var/tmp/dockvm # location of disk image, not supported on tmpfs
+DIR="$TMP/dir"
+DISK=$VAR_TMP/disk.raw
+DISK_SIZE=10G
+KERNEL="$VAR_TMP/bzImage"
+RAM=256m
+SELF="$(readlink -f $0)"
 
 make-container() {
-    docker build -t $TAG .
+    local name="$1"
+    docker build -f "Dockerfile.$name" -t "$name" .
 }
 
 # creates a dir, add files from the docker image
 make-dir() {
-    set -x
-    make-container
-    local dir="$TMP/$TAG"
-    sudo rm -rf $dir
-    mkdir -p $dir
-    docker run --rm -ti -v "$dir:/target" "$TAG" \
+    local tag=dockvm-base
+    local done="$DIR/done"
+
+    [[ -f "$done" && "$done" -nt "Dockerfile.$tag" ]] && return 0
+
+    make-container "$tag"
+    sudo rm -rf "$DIR"
+    mkdir -p "$DIR"
+    docker run --rm -ti -v "$DIR:/target" "$tag" \
         bash -c "tar cf - --one-file-system --exclude /target / | tar xf - -C /target"
-    sudo du -sh "$dir"
+    sudo touch "$DIR/done"
+    sudo du -sh "$DIR"
 }
 
 # create a raw disk image, add files from the docker image
-make-image() {
-    set -x
-    make-container
-    local size=10G
-    local img=$VAR_TMP/$TAG.raw
+make-disk() {
+    local name=dockvm-base
     local mnt=$VAR_TMP/mnt
 
-    rm -f "$img"
-    qemu-img create -f raw $img $size
-    mkfs.ext4 $img
+    make-container "$name"
 
-    mkdir -p $mnt
-    sudo mount $img $mnt
-    docker run --rm -ti -v "$mnt:/target" "$TAG" \
+    rm -f "$DISK"
+    qemu-img create -f raw "$DISK" "$DISK_SIZE"
+    mkfs.ext4 "$DISK"
+
+    mkdir -p "$mnt"
+    sudo mount $DISK $mnt
+    docker run --rm -ti -v "$mnt:/target" "$name" \
         bash -c "tar cf - --one-file-system --exclude /target / | tar xf - -C /target"
-    ls -F $mnt
-    sudo umount $mnt
+    ls -F "$mnt"
+    sudo umount "$mnt"
+    rmdir "$mnt"
+}
+
+make-kernel() {
+    local name="dockvm-kernel"
+
+    [[ "$KERNEL" -nt Dockerfile.kernel ]] && return 0
+
+    make-container "$name"
+    docker run --rm -ti -v "$VAR_TMP:/target" "$name" \
+        bash -c "cp /usr/src/linux/arch/x86/boot/bzImage /target/"
+    du -sh "$KERNEL"
 }
 
 # runs virtiofs on the host, against the dir created by make-dir
 virtiofsd-dir() {
+    local sock="$TMP/sockdir/vhostqemu"
+    make-dir
     mkdir -p $TMP/sockdir
     while :; do
+        (
+            # proper permission fix would be eg using the file group
+            sleep .5
+            sudo chown $USER "$sock"
+        ) &
         sudo /usr/lib/qemu/virtiofsd \
-            --socket-path=$TMP/sockdir/vhostqemu \
-            -o source=$TMP/$TAG \
+            --socket-path="$sock" \
+            -o source=$DIR \
             -o cache=none
     done
 }
@@ -57,50 +84,96 @@ virtiofsd-container() {
     # We want virtiofsd to expose /, but since it does a pivot_root to the target dir
     # we have an error pivoting from / to /. To get around this we bind-mount / to
     # another name.
+    local tag="dockvm-base"
     mkdir -p $TMP/sockdir
     while :; do
         docker run --rm --privileged -ti \
             --security-opt seccomp=unconfined \
             -v $TMP/sockdir:/tmp/sockdir \
-            archlinux-fs bash -c 'pacman -S --noconfirm qemu-virtiofsd \
+            "$tag" bash -c 'pacman -S --noconfirm qemu-virtiofsd \
                 && mkdir /slash \
                 && mount --bind / /slash \
                 && /usr/lib/qemu/virtiofsd --socket-path=/tmp/sockdir/vhostqemu -o source=/slash -o cache=none'
     done
 }
 
-# runs vm against the disk image
-vm-image() {
-    [ "$(whoami)" = root ] || exec sudo $self vm-image
-    local ram=256m
-
-    # uses serial console, C-a X to quit
-    qemu-system-x86_64 \
-        -enable-kvm -smp $(nproc) \
-        -nographic -append "console=ttyS0 rootfstype=ext4 root=/dev/sda rw" \
-        -m $ram \
-        -device virtio-scsi-pci,id=scsi \
-        -drive if=none,id=vd0,format=raw,file=$VAR_TMP/$TAG.raw,cache=none \
-        -device scsi-hd,drive=vd0 \
-        -kernel $TMP/$TAG/boot/bzImage
-}
-
-# runs vm with files served by virtiofsd
-vm-virtiofs() {
-    [ "$(whoami)" = root ] || exec sudo $self vm-virtiofs
-    local ram=256m
+# Runs vm with files served by virtiofsd
+run-virtiofs() {
+    make-dir
 
     # uses serial console, C-a X to quit
     qemu-system-x86_64 \
         -enable-kvm -smp $(nproc) \
         -nographic -append "console=ttyS0 rootfstype=virtiofs root=myfs rw" \
-        -m $ram \
-        -object memory-backend-file,id=mem,size=$ram,mem-path=/dev/shm,share=on \
+        -m $RAM \
+        -object memory-backend-file,id=mem,size=$RAM,mem-path=/dev/shm,share=on \
         -numa node,memdev=mem \
         -chardev socket,id=char0,path=$TMP/sockdir/vhostqemu \
         -device vhost-user-fs-pci,queue-size=1024,chardev=char0,tag=myfs \
-        -kernel $TMP/$TAG/boot/bzImage
+        -kernel "$KERNEL"
+}
+
+# runs vm against the disk image
+run-image() {
+    make-kernel
+    make-disk
+
+    local image="$VAR_TMP/x"
+    # uses serial console, C-a X to quit
+    qemu-system-x86_64 \
+        -enable-kvm -smp $(nproc) \
+        -nographic -append "console=ttyS0 rootfstype=ext4 root=/dev/sda rw" \
+        -m $RAM \
+        -device virtio-scsi-pci,id=scsi \
+        -drive if=none,id=vd0,format=raw,file=$image,cache=none \
+        -device scsi-hd,drive=vd0 \
+        -kernel "$KERNEL"
+}
+
+# runs vm against the disk image, libvirt version
+run-image-libvirt() {
+    local DISK=$VAR_TMP/disk.raw
+    local vm=dockvm1
+
+    make-kernel
+    make-disk
+
+    virsh list --all | grep $vm && {
+        virsh destroy $vm || true
+        virsh reset $vm || true
+        virsh undefine --managed-save $vm || true
+    }
+
+    virt-install \
+      --import \
+      --print-xml \
+      --name $vm \
+      --memory 256 \
+      --vcpus=$(nproc),maxvcpus=$(nproc) \
+      --cpu host \
+      --os-variant=archlinux \
+      --network user \
+      --virt-type kvm \
+      --disk path=$DISK,format=raw \
+      --boot kernel=$KERNEL,kernel_args="console=ttyS0 root=/dev/vda rw" \
+      --graphics=none \
+    > $TMP/$vm.xml
+
+    virsh define $TMP/$vm.xml
+    virsh list --all
+    virsh start $vm --console
+}
+
+# runs systemd container
+run-container() {
+    local name=dockvm-systemd
+    make-container "$name"
+    docker run --rm --name "$name" -ti \
+        --cap-add SYS_ADMIN \
+        -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+        "$name"
 }
 
 cd "$(dirname $0)"
+mkdir -p "$TMP" "$VAR_TMP"
 "$@"
